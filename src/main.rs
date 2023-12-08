@@ -1,134 +1,166 @@
-use std::io::{Write, Read};
-use std::os::unix::net::{UnixStream, UnixListener};
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use timeout_readwrite::TimeoutReader;
+use crate::socket_protocol::Message;
 
-#[repr(u8)]
-enum ForkerCommand {
-    Ack = 42,
-    Fork = 1,
+mod socket_protocol;
+
+#[derive(Debug)]
+pub struct SocketPair {
+    sc_socket: UnixStream,
+    cs_socket: UnixStream,
 }
 
-fn wait_ack_response(forker_mgr_socket: &mut UnixStream) {
-    let mut buf = [0u8; 1];
-    forker_mgr_socket.read_exact(&mut buf).expect("Expected message from Forker");
+impl SocketPair {
+    pub fn new_paths() -> std::io::Result<(String, String)> {
+        static IDX_CTR: AtomicU64 = AtomicU64::new(0);
 
-    if buf[0] != ForkerCommand::Ack as u8 {
-        eprintln!("[MANAGER]: ERROR. Expected an ACK from Forker");
-        std::process::exit(1);
+        let idx = IDX_CTR.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let sc_socket_path = format!("/tmp/vsm-{idx}-sc");
+        let cs_socket_path = format!("/tmp/vsm-{idx}-cs");
+
+        if Path::new(&sc_socket_path).exists() {
+            let _ = std::fs::remove_file(&sc_socket_path);
+        }
+
+        if Path::new(&cs_socket_path).exists() {
+            let _ = std::fs::remove_file(&cs_socket_path);
+        }
+
+        Ok((sc_socket_path, cs_socket_path))
+    }
+
+    pub fn new_server(sc_socket_path: &str, cs_socket_path: &str) -> std::io::Result<SocketPair> {
+        let cs_socket_listener = UnixListener::bind(&cs_socket_path)?;
+        let (cs_socket, _cs_socket_addr) = cs_socket_listener.accept()?;
+
+        let sc_socket = UnixStream::connect(&sc_socket_path)?;
+
+        let pair = Self {
+            sc_socket,
+            cs_socket,
+        };
+
+        Ok(pair)
+    }
+
+    pub fn new_fork(server_pair: &mut Self) -> std::io::Result<SocketPair> {
+        let (sc_socket_path, cs_socket_path) = Self::new_paths()?;
+
+        let cs_socket_listener = UnixListener::bind(&cs_socket_path)?;
+
+        server_pair
+            .send_message(Message::Fork {
+                sc_socket: sc_socket_path.to_string(),
+                cs_socket: cs_socket_path.to_string(),
+            })
+            .unwrap();
+
+        let (cs_socket, _cs_socket_addr) = cs_socket_listener.accept()?;
+        let sc_socket = UnixStream::connect(&sc_socket_path)?;
+
+        let pair = Self {
+            sc_socket,
+            cs_socket,
+        };
+
+        Ok(pair)
+    }
+
+    pub fn read_message(&mut self) -> Result<Message, ()> {
+        use socket_protocol::FromReader;
+        let msg = Message::from_reader(&mut self.cs_socket).map_err(|_| ())?;
+        Ok(msg)
+    }
+
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.cs_socket.set_read_timeout(timeout)?;
+        Ok(())
+    }
+
+    pub fn send_message(&mut self, msg: Message) -> Result<(), ()> {
+        use socket_protocol::ToWriter;
+        msg.to_writer(&mut self.sc_socket).map_err(|_| ())?;
+        self.sc_socket.flush().map_err(|_| ())?;
+        Ok(())
     }
 }
 
-fn ask_forker_fork(mgr_forker_sock: &mut UnixStream, forker_mgr_sock: &mut UnixStream) -> (UnixStream, UnixStream) {
-    mgr_forker_sock.write_all(&[ForkerCommand::Fork as u8]).unwrap();
-    mgr_forker_sock.flush().unwrap();
+pub struct ForkServer {
+    server: Child,
+    server_sockets: SocketPair,
 
-    wait_ack_response(forker_mgr_sock);
+    forks: Vec<SocketPair>,
+}
 
-    static IDX_CTR: Mutex<u64> = Mutex::new(0);
+impl ForkServer {
+    pub fn new(cmd: &str) -> std::io::Result<Self> {
+        static ALREADY_CREATED: AtomicBool = AtomicBool::new(false);
 
-    let mut guard = IDX_CTR.lock().unwrap();
-    let idx = *guard;
-    *guard = guard.checked_add(1).expect("Client Index overflowed");
+        let is_already_created =
+            ALREADY_CREATED.fetch_or(true, std::sync::atomic::Ordering::SeqCst);
 
-    let client_mgr_socket_path = format!("/tmp/vsm-{idx}-client-mgr");
-    let mgr_client_socket_path = format!("/tmp/vsm-{idx}-mgr-client");
+        if is_already_created {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Fork server already exists",
+            ));
+        }
 
-    if Path::new(&client_mgr_socket_path).exists() {
-        let _ = std::fs::remove_file(&client_mgr_socket_path).unwrap();
+        let (sc_socket_path, cs_socket_path) = SocketPair::new_paths()?;
+
+        let mut server = Command::new(cmd);
+
+        server.arg(&sc_socket_path);
+        server.arg(&cs_socket_path);
+
+        server.stdin(Stdio::null());
+        server.stdout(Stdio::inherit());
+        server.stderr(Stdio::inherit());
+
+        let server = server.spawn()?;
+        let server_sockets = SocketPair::new_server(&sc_socket_path, &cs_socket_path)?;
+
+        let fork_server = Self {
+            server,
+            server_sockets,
+
+            forks: Vec::new(),
+        };
+
+        Ok(fork_server)
     }
 
-    let client_mgr_sock_listener = UnixListener::bind(&client_mgr_socket_path).expect("Failed to connect to Client->Manager socket");
+    pub fn create_fork(&mut self) -> std::io::Result<usize> {
+        let pair = SocketPair::new_fork(&mut self.server_sockets)?;
 
-    mgr_forker_sock.write_all(&(mgr_client_socket_path.len() as u32).to_be_bytes()).unwrap();
-    mgr_forker_sock.write_all(&(client_mgr_socket_path.len() as u32).to_be_bytes()).unwrap();
+        let idx = self.forks.len();
+        self.forks.push(pair);
 
-    write!(mgr_forker_sock, "{mgr_client_socket_path}").unwrap();
-    write!(mgr_forker_sock, "{client_mgr_socket_path}").unwrap();
-    mgr_forker_sock.flush().unwrap();
-
-    println!("[MANAGER]: Waiting for acknowledge of socket paths");
-    wait_ack_response(forker_mgr_sock);
-
-    let mgr_client_sock = UnixStream::connect(mgr_client_socket_path).expect("Failed to connect to Manager->Client socket");
-    let (client_mgr_sock, _client_mgr_sock_addr) = client_mgr_sock_listener.accept().expect("Failed to accept a connection for Client->Manager socket");
-
-    println!("[MANAGER]: Established socket connection with client {idx}!");
-
-    mgr_client_sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
-    client_mgr_sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-
-    (mgr_client_sock, client_mgr_sock)
+        Ok(idx)
+    }
 }
 
 fn main() {
-    let mut forker = Command::new("./socket-test.py");
-        
-    forker.stdin(Stdio::piped());
-    forker.stdout(Stdio::piped());
+    let cmd = format!(
+        "{}/socket-test.py",
+        std::env::current_dir().unwrap().to_str().unwrap()
+    );
+    let mut fork_server = ForkServer::new(&cmd).unwrap();
 
-    let forker_proc = forker.spawn().expect("Failed to start forker");
-
-    let mut forker_stdin = forker_proc.stdin.expect("Failed to grab forker stdin");
-    let forker_stdout = forker_proc.stdout.expect("Failed to grab forker stdout");
-
-    let mut forker_stdout = TimeoutReader::new(forker_stdout, Duration::from_secs(3));
-
-    writeln!(forker_stdin, "Hello Forker!").unwrap();
-    forker_stdin.flush().unwrap();
-
-    println!("[MANAGER]: Waiting for Hello");
-    const HELLO_RESPONSE: &[u8] = b"Hello Manager!\n";
-    let mut return_value = [0u8; HELLO_RESPONSE.len()];
-    match forker_stdout.read_exact(&mut return_value) {
-        Ok(_) if return_value == HELLO_RESPONSE => {},
-        Ok(_) => panic!("Invalid hello response from forker: {}", String::from_utf8_lossy(&return_value)),
-        Err(err) if err.kind() == std::io::ErrorKind::TimedOut => panic!("Forker hello response timed out"),
-        Err(err) => panic!("Forker hello response error: {err:?}"),
-    };
-
-    const MGR_FORKER_SOCKET_PATH: &str = "/tmp/vsm-forker-mgr-forker";
-    const FORKER_MGR_SOCKET_PATH: &str = "/tmp/vsm-forker-forker-mgr";
-
-    if Path::new(FORKER_MGR_SOCKET_PATH).exists() {
-        let _ = std::fs::remove_file(FORKER_MGR_SOCKET_PATH).unwrap();
-    }
-
-    let forker_mgr_sock_listener = UnixListener::bind(FORKER_MGR_SOCKET_PATH).expect("Failed to connect to Forker->Manager socket");
-
-    writeln!(forker_stdin, "{MGR_FORKER_SOCKET_PATH}").unwrap();
-    writeln!(forker_stdin, "{FORKER_MGR_SOCKET_PATH}").unwrap();
-    forker_stdin.flush().unwrap();
-
-    println!("[MANAGER]: Waiting for Sockets");
-    const SOCKET_RESPONSE: &[u8] = b"Received Sockets!\n";
-    let mut return_value = [0u8; SOCKET_RESPONSE.len()];
-    match forker_stdout.read_exact(&mut return_value) {
-        Ok(_) if return_value == SOCKET_RESPONSE => {},
-        Ok(_) => panic!("Invalid socket response from forker: {}", String::from_utf8_lossy(&return_value)),
-        Err(err) if err.kind() == std::io::ErrorKind::TimedOut => panic!("Forker socket response timed out"),
-        Err(err) => panic!("Forker socket response error: {err:?}"),
-    };
-
-    let mut mgr_forker_sock = UnixStream::connect(MGR_FORKER_SOCKET_PATH).expect("Failed to connect to Manager->Forker socket");
-    let (mut forker_mgr_sock, _forker_mgr_sock_addr) = forker_mgr_sock_listener.accept().expect("Failed to accept a connection for Forker->Manager socket");
-
-    println!("[MANAGER]: Established socket connection!");
-
-    drop(forker_stdin);
-    drop(forker_stdout);
-
-    mgr_forker_sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
-    forker_mgr_sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-
-    let mut sockets = Vec::new();
-    for i in 0..10 {
-        sockets.push(ask_forker_fork(&mut mgr_forker_sock, &mut forker_mgr_sock));
-        println!("[MANAGER]: Fork {i} done");
+    for _ in 0..10 {
+        let idx = fork_server.create_fork().unwrap();
+        fork_server.forks[idx]
+            .send_message(Message::Data {
+                content: vec![0x13, 0x37, 0x42],
+            })
+            .unwrap();
     }
 
     loop {}
