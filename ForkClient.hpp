@@ -2,24 +2,29 @@
 #define __FORK_CLIENT_H__
 
 class SocketPair {
-private:
+  public:
     int sc_socket_fd;
     int cs_socket_fd;
 
-public:
-    SocketPair(const char* sc_socket_path, const char* cs_socket_path);
+    SocketPair();
+    SocketPair(const char *sc_socket_path, const char *cs_socket_path);
     ~SocketPair();
 };
 
-class ForkClient {
-private:
-    SocketPair* pair;
+struct fork_result_t {
+    bool is_fork;
+    SocketPair socket_pair;
+};
 
-public:
-    ForkClient(const int argc, const char** argv);
+class ForkClient {
+  private:
+    SocketPair *pair;
+
+  public:
+    ForkClient(const int argc, const char **argv);
     ~ForkClient();
 
-    int await_fork(SocketPair* fork_pair);
+    SocketPair *await_fork();
 };
 
 #endif // __FORK_CLIENT_H__

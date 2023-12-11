@@ -2,87 +2,127 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <sys/socket.h>
+#include <unistd.h>
 
-Message::Message() : variant(MSG_ACK), data_size(0), content() {}
+Message::Message() : variant(MSG_ACK), content() {}
 Message::~Message() {
     switch (this->variant) {
     case (MSG_ACK):
     case (MSG_STATUS_CHECK):
         break;
     case (MSG_FAIL):
-        free(this->content.str);
+        free(this->content.str.ptr);
         break;
     case (MSG_FORK):
-        free(this->content.paths[0]);
-        free(this->content.paths[1]);
+        free(this->content.paths[0].ptr);
+        free(this->content.paths[1].ptr);
         break;
     case (MSG_DATA):
-        free(this->content.bytearray);
+        free(this->content.bytearray.ptr);
         break;
     }
 }
 
-char* take_string(int fd, size_t* len) {
-	uint8_t bs[2];
+data_str_t take_string(int fd) {
+    uint8_t bs[2];
 
-	if (read(fd, bs, 2) < 0) {
-		perror("Read error");
-		exit(1);
-	}
+    if (recv(fd, bs, 2, 0) < 0) {
+        perror("Read error");
+        exit(1);
+    }
 
-	size_t hb = (size_t) bs[1];
-	size_t lb = (size_t) bs[0];
+    size_t hb = (size_t)bs[1];
+    size_t lb = (size_t)bs[0];
 
-	*len = (hb << 8) | lb;
+    data_str_t str;
 
-	char *buf = (char*) malloc(*len);
+    str.len = (hb << 8) | lb;
+    str.ptr = (char *)malloc(str.len);
 
-	if (buf == NULL) {
-		perror("Failed to allocate");
-		exit(1);
-	}
+    if (str.ptr == NULL) {
+        perror("Failed to allocate");
+        exit(1);
+    }
 
-	if (read(fd, buf, *len) < 0) {
-		perror("Read error");
-		exit(1);
-	}
+    if (recv(fd, str.ptr, str.len, 0) < 0) {
+        perror("Read error");
+        exit(1);
+    }
 
-	return buf;
+    return str;
 }
 
-uint8_t* take_data(int fd, size_t* len) {
-	uint8_t bs[4];
+data_bytearray_t take_bytearray(int fd) {
+    uint8_t bs[4];
 
-	if (read(fd, bs, 4) < 0) {
-		perror("Read error");
-		exit(1);
-	}
+    if (recv(fd, bs, 4, 0) < 0) {
+        perror("Read error");
+        exit(1);
+    }
 
-	size_t b3 = (size_t) bs[3];
-	size_t b2 = (size_t) bs[2];
-	size_t b1 = (size_t) bs[1];
-	size_t b0 = (size_t) bs[0];
+    size_t b3 = (size_t)bs[3];
+    size_t b2 = (size_t)bs[2];
+    size_t b1 = (size_t)bs[1];
+    size_t b0 = (size_t)bs[0];
 
-	*len = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+    data_bytearray_t bytearray;
 
-	uint8_t *buf = (uint8_t*) malloc(*len);
+    bytearray.len = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+    bytearray.ptr = (uint8_t *)malloc(bytearray.len);
 
-	if (buf == NULL) {
-		perror("Failed to allocate");
-		exit(1);
-	}
+    if (bytearray.ptr == NULL) {
+        perror("Failed to allocate");
+        exit(1);
+    }
 
-	if (read(fd, buf, *len) < 0) {
-		perror("Read error");
-		exit(1);
-	}
+    if (recv(fd, bytearray.ptr, bytearray.len, 0) < 0) {
+        perror("Read error");
+        exit(1);
+    }
 
-	return buf;
+    return bytearray;
+}
+
+void write_str(int fd, data_str_t str) {
+    uint8_t bs[2];
+
+    bs[0] = (str.len >> 0) & 0xFF;
+    bs[1] = (str.len >> 8) & 0xFF;
+
+    if (send(fd, bs, 2, 0) < 0) {
+        perror("Write error");
+        exit(1);
+    }
+
+    if (send(fd, str.ptr, str.len, 0) < 0) {
+        perror("Write error");
+        exit(1);
+    }
+}
+
+void write_bytearray(int fd, data_bytearray_t bytearray) {
+    uint8_t bs[4];
+
+    bs[0] = (bytearray.len >> 0) & 0xFF;
+    bs[1] = (bytearray.len >> 8) & 0xFF;
+    bs[2] = (bytearray.len >> 16) & 0xFF;
+    bs[3] = (bytearray.len >> 24) & 0xFF;
+
+    if (send(fd, bs, 4, 0) < 0) {
+        perror("Write error");
+        exit(1);
+    }
+
+    if (send(fd, bytearray.ptr, bytearray.len, 0) < 0) {
+        perror("Write error");
+        exit(1);
+    }
 }
 
 Message Message::read_from_socket(int fd) {
     uint8_t variant;
-    if (read(fd, &variant, 1) < 0) {
+    if (recv(fd, &variant, 1, 0) < 0) {
         perror("Read error");
         exit(1);
     }
@@ -91,31 +131,18 @@ Message Message::read_from_socket(int fd) {
     msg.variant = (message_variant_t)variant;
 
     switch (variant) {
-    case (MSG_ACK):
-    case (MSG_STATUS_CHECK):
+    case MSG_ACK:
+    case MSG_STATUS_CHECK:
         break;
-    case (MSG_FAIL):
-		size_t len = 0;
-		char* content = take_string(fd, &len);
-
-		msg.data_size = len;
-		msg.content.str = content;
-
+    case MSG_FAIL:
+        msg.content.str = take_string(fd);
         break;
-    case (MSG_FORK):
-		size_t path0_len = 0;
-		char* path0 = take_string(fd, &len);
-		size_t path1_len = 0;
-		char* path1 = take_string(fd, &len);
-
-		// TODO: Properly set the lengths
-
+    case MSG_FORK:
+        msg.content.paths[0] = take_string(fd);
+        msg.content.paths[1] = take_string(fd);
         break;
-    case (MSG_DATA):
-        if (send(fd, this->content.bytearray, this->data_size, 0) < 0) {
-            perror("Send error");
-            exit(1);
-        }
+    case MSG_DATA:
+        msg.content.bytearray = take_bytearray(fd);
         break;
     default:
         perror("Invalid variant");
@@ -138,20 +165,14 @@ void Message::write_to_socket(int fd) {
     case (MSG_STATUS_CHECK):
         break;
     case (MSG_FAIL):
-        if (send(fd, this->content.str, this->data_size, 0) < 0) {
-            perror("Send error");
-            exit(1);
-        }
+        write_str(fd, this->content.str);
         break;
     case (MSG_FORK):
         perror("Client cannot send fork requests to server.");
         exit(1);
         break;
     case (MSG_DATA):
-        if (send(fd, this->content.bytearray, this->data_size, 0) < 0) {
-            perror("Send error");
-            exit(1);
-        }
+        write_bytearray(fd, this->content.bytearray);
         break;
     }
 }
@@ -162,11 +183,11 @@ Message Message::ack() {
     return msg;
 }
 
-Message Message::fail(char *str, size_t len) {
+Message Message::fail(char *str, uint16_t len) {
     Message msg;
     msg.variant = MSG_FAIL;
-    msg.data_size = len;
-    msg.content.str = str;
+    msg.content.str.ptr = str;
+    msg.content.str.len = len;
     return msg;
 }
 
@@ -176,10 +197,10 @@ Message Message::status_check() {
     return msg;
 }
 
-Message Message::data_msg(uint8_t *bytearray, size_t len) {
+Message Message::data_msg(uint8_t *bytearray, uint32_t len) {
     Message msg;
     msg.variant = MSG_DATA;
-    msg.data_size = len;
-    msg.content.bytearray = bytearray;
+    msg.content.bytearray.ptr = bytearray;
+    msg.content.bytearray.len = len;
     return msg;
 }

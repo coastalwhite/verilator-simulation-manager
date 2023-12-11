@@ -13,20 +13,30 @@ enum message_variant_t {
     MSG_DATA = 17,
 };
 
+struct data_bytearray_t {
+    uint32_t len;
+    uint8_t* ptr;
+};
+
+struct data_str_t {
+    uint16_t len;
+    char* ptr;
+};
+
 union message_data_t {
-    uint8_t* bytearray;
-    char* str;
-    char* paths[2];
+    data_bytearray_t bytearray;
+    data_str_t str;
+    data_str_t paths[2];
 
 	message_data_t() {
-		this->str = (char*) 0;
+		this->bytearray.len = 0;
+		this->bytearray.ptr = (uint8_t*) 0;
 	}
 };
 
 class Message {
 public:
     message_variant_t variant;
-	size_t data_size;
     message_data_t content;
 
     Message();
@@ -36,9 +46,9 @@ public:
 	void write_to_socket(int fd);
 
     static Message ack();
-    static Message fail(char *str, size_t len);
+    static Message fail(char *str, uint16_t len);
     static Message status_check();
-    static Message data_msg(uint8_t *bytearray, size_t len);
+    static Message data_msg(uint8_t *bytearray, uint32_t len);
 };
 
 #endif // __PROTOCOL_HPP__

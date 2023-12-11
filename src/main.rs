@@ -149,7 +149,7 @@ impl ForkServer {
 
 fn main() {
     let cmd = format!(
-        "{}/socket-test.py",
+        "{}/fork_client",
         std::env::current_dir().unwrap().to_str().unwrap()
     );
     let mut fork_server = ForkServer::new(&cmd).unwrap();
