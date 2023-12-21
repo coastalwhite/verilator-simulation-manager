@@ -207,6 +207,7 @@ define_messages! {
     0 = Fail { msg: String },
     1 = Ack,
     2 = StatusCheck,
+    3 = Exit,
     16 = Fork { sc_socket: String, cs_socket: String },
     17 = Data { content: Vec<u8> },
 }

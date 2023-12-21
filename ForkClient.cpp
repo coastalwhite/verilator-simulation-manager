@@ -3,6 +3,7 @@
 #include "Protocol.hpp"
 #include <stdio.h>
 #include <stdlib.h>
+#include <filesystem>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -79,6 +80,9 @@ SocketPair* ForkClient::await_fork() {
     while (1) {
         Message msg = Message::read_from_socket(this->pair->sc_socket_fd);
         switch (msg.variant) {
+        case MSG_EXIT:
+            exit(0);
+            break;
         case MSG_FAIL:
             perror("Received a fail message");
             exit(1);

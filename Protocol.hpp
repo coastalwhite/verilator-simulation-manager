@@ -8,6 +8,7 @@ enum message_variant_t {
     MSG_FAIL = 0,
     MSG_ACK  = 1,
     MSG_STATUS_CHECK = 2,
+    MSG_EXIT = 3,
 
     MSG_FORK = 16,
     MSG_DATA = 17,
