@@ -1,77 +1,70 @@
 use std::fmt::Display;
 
 #[derive(Debug)]
-pub enum FromReaderError {
+pub enum ProtocolError {
     Io(std::io::Error),
     Utf8(std::string::FromUtf8Error),
+    InvalidMessageVariant(u8),
+    StringOverflow,
+    BytearrayOverflow,
+    PlatformConvert(&'static str),
     Other(String),
 }
 
-#[derive(Debug)]
-pub enum ToWriterError {
-    Io(std::io::Error),
-    Other(String),
+pub type ProtocolResult<T> = Result<T, ProtocolError>;
+
+impl ProtocolError {
+    pub fn other(msg: impl Into<String>) -> Self {
+        Self::Other(msg.into())
+    }
 }
 
-impl Display for ToWriterError {
+impl Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ToWriterError::Io(err) => write!(f, "IOError: {err}"),
-            ToWriterError::Other(s) => f.write_str(&s),
+            ProtocolError::Io(err) => write!(f, "IOError: {err}"),
+            ProtocolError::Utf8(err) => write!(f, "Utf8: {err}"),
+            ProtocolError::InvalidMessageVariant(b) => write!(f, "Invalid message variant: 0x{b:02X}"),
+            ProtocolError::StringOverflow => write!(f, "Given string is too large to be sent"),
+            ProtocolError::BytearrayOverflow => write!(f, "Given bytearray is too large to be sent"),
+            ProtocolError::PlatformConvert(t) => write!(f, "Platform is unable to convert {t} to usize"),
+            ProtocolError::Other(s) => f.write_str(&s),
         }
     }
 }
 
-impl std::error::Error for ToWriterError {}
+impl std::error::Error for ProtocolError {}
 
-impl From<std::io::Error> for FromReaderError {
+impl From<std::io::Error> for ProtocolError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
     }
 }
 
-impl From<std::io::Error> for ToWriterError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
-    }
-}
-
-impl From<std::string::FromUtf8Error> for FromReaderError {
+impl From<std::string::FromUtf8Error> for ProtocolError {
     fn from(value: std::string::FromUtf8Error) -> Self {
         Self::Utf8(value)
     }
 }
 
-impl From<&'static str> for ToWriterError {
+impl From<&'static str> for ProtocolError {
     fn from(value: &'static str) -> Self {
         Self::Other(value.to_string())
     }
 }
 
-impl From<&'static str> for FromReaderError {
-    fn from(value: &'static str) -> Self {
-        Self::Other(value.to_string())
-    }
-}
-
-impl From<String> for ToWriterError {
-    fn from(value: String) -> Self {
-        Self::Other(value)
-    }
-}
-
-impl From<String> for FromReaderError {
+impl From<String> for ProtocolError {
     fn from(value: String) -> Self {
         Self::Other(value)
     }
 }
 
 pub trait FromReader: Sized {
-    fn from_reader(reader: &mut impl std::io::Read) -> Result<Self, FromReaderError>;
+    fn from_reader(reader: &mut impl std::io::Read) -> ProtocolResult<Self>;
 }
 
 pub trait ToWriter: Sized {
-    fn to_writer(&self, writer: &mut impl std::io::Write) -> Result<(), ToWriterError>;
+    fn to_writer(&self, writer: &mut impl std::io::Write) -> ProtocolResult<()>;
 }
 
 macro_rules! define_messages {
@@ -94,23 +87,24 @@ macro_rules! define_messages {
         }
 
         impl TryFrom<u8> for MessageVariant {
-            type Error = ();
+            type Error = u8;
             fn try_from(v: u8) -> Result<Self, Self::Error> {
                 match v {
                     $(
                     $repr => Ok(Self::$name),
                     )+
-                    _ => Err(()),
+                    _ => Err(v),
                 }
             }
         }
 
         impl FromReader for Message {
-            fn from_reader(reader: &mut impl std::io::Read) -> Result<Self, FromReaderError> {
+            fn from_reader(reader: &mut impl std::io::Read) -> ProtocolResult<Self> {
                 let mut variant = 0u8;
                 reader.read_exact(std::slice::from_mut(&mut variant))?;
 
-                let variant = MessageVariant::try_from(variant).map_err(|_| format!("Invalid message variant: {variant}"))?;
+                let variant = MessageVariant::try_from(variant)
+                    .map_err(|v| ProtocolError::InvalidMessageVariant(v))?;
 
                 match variant {
                     $(
@@ -127,7 +121,7 @@ macro_rules! define_messages {
         }
 
         impl ToWriter for MessageVariant {
-            fn to_writer(&self, writer: &mut impl std::io::Write) -> Result<(), ToWriterError> {
+            fn to_writer(&self, writer: &mut impl std::io::Write) -> ProtocolResult<()> {
                 let variant = *self as u8;
                 writer.write_all(&[variant])?;
                 Ok(())
@@ -135,7 +129,7 @@ macro_rules! define_messages {
         }
 
         impl ToWriter for Message {
-            fn to_writer(&self, writer: &mut impl std::io::Write) -> Result<(), ToWriterError> {
+            fn to_writer(&self, writer: &mut impl std::io::Write) -> ProtocolResult<()> {
                 match self {
                     $(
                     Self::$name$({ $($field_name),+ })? => {
@@ -157,7 +151,7 @@ macro_rules! impl_io_for_nums {
     ($($numty:ty),+ $(,)?) => {
         $(
         impl FromReader for $numty {
-            fn from_reader(reader: &mut impl std::io::Read) -> Result<Self, FromReaderError> {
+            fn from_reader(reader: &mut impl std::io::Read) -> ProtocolResult<Self> {
                 let mut buf = [0u8; std::mem::size_of::<$numty>()];
                 reader.read_exact(&mut buf)?;
                 Ok(<$numty>::from_le_bytes(buf))
@@ -165,7 +159,7 @@ macro_rules! impl_io_for_nums {
         }
 
         impl ToWriter for $numty {
-            fn to_writer(&self, writer: &mut impl std::io::Write) -> Result<(), ToWriterError> {
+            fn to_writer(&self, writer: &mut impl std::io::Write) -> ProtocolResult<()> {
                 Ok(writer.write_all(&self.to_le_bytes())?)
             }
         }
@@ -181,7 +175,7 @@ impl_io_for_nums! {
 }
 
 impl FromReader for String {
-    fn from_reader(reader: &mut impl std::io::Read) -> Result<Self, FromReaderError> {
+    fn from_reader(reader: &mut impl std::io::Read) -> ProtocolResult<Self> {
         let len = u16::from_reader(reader)?;
         let mut buf = vec![0; len.into()];
         reader.read_exact(&mut buf)?;
@@ -190,8 +184,8 @@ impl FromReader for String {
 }
 
 impl ToWriter for String {
-    fn to_writer(&self, writer: &mut impl std::io::Write) -> Result<(), ToWriterError> {
-        let len: u16 = self.len().try_into().map_err(|_| "String length is too big to send")?;
+    fn to_writer(&self, writer: &mut impl std::io::Write) -> ProtocolResult<()> {
+        let len: u16 = self.len().try_into().map_err(|_| ProtocolError::StringOverflow)?;
         len.to_writer(writer)?;
         writer.write_all(self.as_bytes())?;
 
@@ -200,17 +194,18 @@ impl ToWriter for String {
 }
 
 impl FromReader for Vec<u8> {
-    fn from_reader(reader: &mut impl std::io::Read) -> Result<Self, FromReaderError> {
+    fn from_reader(reader: &mut impl std::io::Read) -> ProtocolResult<Self> {
         let len = u32::from_reader(reader)?;
-        let mut buf = vec![0; len.try_into().map_err(|_| "Platform does not support this vector size")?];
+        let len = usize::try_from(len).map_err(|_| ProtocolError::PlatformConvert("u32"))?;
+        let mut buf = vec![0; len];
         reader.read_exact(&mut buf)?;
         Ok(buf)
     }
 }
 
 impl ToWriter for Vec<u8> {
-    fn to_writer(&self, writer: &mut impl std::io::Write) -> Result<(), ToWriterError> {
-        let len: u32 = self.len().try_into().map_err(|_| "Vector length is too big to send")?;
+    fn to_writer(&self, writer: &mut impl std::io::Write) -> ProtocolResult<()> {
+        let len: u32 = self.len().try_into().map_err(|_| ProtocolError::BytearrayOverflow)?;
         len.to_writer(writer)?;
         writer.write_all(self)?;
 
@@ -226,4 +221,5 @@ define_messages! {
 
     16 = Fork { socket_path: String },
     17 = Data { content: Vec<u8> },
+    18 = InputWidth { width: u32 },
 }

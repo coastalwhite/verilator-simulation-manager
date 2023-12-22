@@ -1,17 +1,16 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::io::{self, Read, Write};
-use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::time::{self, Duration, SystemTime};
 
-use crate::socket_protocol::Message;
+use crate::socket_protocol::{Message, ProtocolError};
 
-use self::socket_protocol::ToWriterError;
+use self::socket_protocol::ProtocolResult;
 
 mod socket_protocol;
 
@@ -21,7 +20,7 @@ pub struct Socket {
 }
 
 impl Socket {
-    pub fn new_path(idx: usize) -> std::io::Result<String> {
+    pub fn new_path(idx: usize) -> ProtocolResult<String> {
         let socket_path = format!("/tmp/vsm-{idx}");
 
         if Path::new(&socket_path).exists() {
@@ -31,16 +30,19 @@ impl Socket {
         Ok(socket_path)
     }
 
-    pub fn new_server(socket_path: &str) -> std::io::Result<Socket> {
+    pub fn new_server(socket_path: &str) -> ProtocolResult<Socket> {
         let socket_listener = UnixListener::bind(&socket_path)?;
         let (stream, _socket_addr) = socket_listener.accept()?;
+
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(1)))?;
 
         let socket = Self { stream };
 
         Ok(socket)
     }
 
-    pub fn new_fork(server_pair: &mut Self, idx: usize) -> std::io::Result<Socket> {
+    pub fn new_fork(server_pair: &mut Self, idx: usize) -> ProtocolResult<Socket> {
         let socket_path = Self::new_path(idx + 1)?;
 
         let socket_listener = UnixListener::bind(&socket_path)?;
@@ -49,6 +51,7 @@ impl Socket {
             .unwrap();
         let (stream, _socket_addr) = socket_listener.accept()?;
 
+        stream.set_nonblocking(true)?;
         let socket = Self { stream };
 
         Ok(socket)
@@ -56,21 +59,23 @@ impl Socket {
 
     pub fn try_read_message(&mut self) -> Option<Message> {
         use socket_protocol::FromReader;
-
-        self.stream.set_nonblocking(true).unwrap();
-        let msg = Message::from_reader(&mut self.stream);
-        self.stream.set_nonblocking(false).unwrap();
-
-        msg.ok()
+        Message::from_reader(&mut self.stream)
+            .map_err(|err| {
+                if !matches!(&err, ProtocolError::Io(io_err) if io_err.kind() == std::io::ErrorKind::WouldBlock) {
+                    dbg!(&err);
+                }
+                err
+            })
+            .ok()
     }
 
-    pub fn read_message(&mut self) -> Result<Message, ()> {
+    pub fn read_message(&mut self) -> ProtocolResult<Message> {
         use socket_protocol::FromReader;
-        let msg = Message::from_reader(&mut self.stream).map_err(|_| ())?;
+        let msg = Message::from_reader(&mut self.stream)?;
         Ok(msg)
     }
 
-    pub fn send_message(&mut self, msg: &Message) -> Result<(), ToWriterError> {
+    pub fn send_message(&mut self, msg: &Message) -> ProtocolResult<()> {
         use socket_protocol::ToWriter;
 
         msg.to_writer(&mut self.stream)?;
@@ -82,22 +87,19 @@ impl Socket {
 
 pub struct ForkServer {
     server: Child,
-    server_sockets: Socket,
+    server_socket: Socket,
     forks: Vec<Socket>,
 }
 
 impl ForkServer {
-    pub fn new(cmd: &str) -> std::io::Result<Self> {
+    pub fn new(cmd: &str) -> ProtocolResult<Self> {
         static ALREADY_CREATED: AtomicBool = AtomicBool::new(false);
 
         let is_already_created =
             ALREADY_CREATED.fetch_or(true, std::sync::atomic::Ordering::SeqCst);
 
         if is_already_created {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Fork server already exists",
-            ));
+            return Err(ProtocolError::other("Fork server already exists"));
         }
 
         let socket_path = Socket::new_path(0)?;
@@ -115,7 +117,7 @@ impl ForkServer {
 
         let fork_server = Self {
             server,
-            server_sockets,
+            server_socket: server_sockets,
 
             forks: Vec::new(),
         };
@@ -123,16 +125,16 @@ impl ForkServer {
         Ok(fork_server)
     }
 
-    pub fn create_fork(&mut self) -> std::io::Result<usize> {
+    pub fn create_fork(&mut self) -> ProtocolResult<usize> {
         let idx = self.forks.len();
-        let socket = Socket::new_fork(&mut self.server_sockets, idx)?;
+        let socket = Socket::new_fork(&mut self.server_socket, idx)?;
         self.forks.push(socket);
 
         Ok(idx)
     }
 
-    pub fn replace_fork(&mut self, at: usize) -> std::io::Result<()> {
-        let pair = Socket::new_fork(&mut self.server_sockets, at)?;
+    pub fn replace_fork(&mut self, at: usize) -> ProtocolResult<()> {
+        let pair = Socket::new_fork(&mut self.server_socket, at)?;
 
         self.forks[at] = pair;
 
@@ -140,14 +142,20 @@ impl ForkServer {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FuzzInput {
-    content: u64,
+    content: Vec<u8>,
 }
 
 pub struct FuzzServer {
     fork_server: ForkServer,
+
+    current_datas: Vec<Option<FuzzInput>>,
+
     mutator: FuzzMutator,
-    queue: VecDeque<FuzzInput>,
+
+    run_queue: Vec<FuzzInput>,
+    mutation_queue: Vec<FuzzInput>,
 }
 
 pub enum FuzzFinish {
@@ -178,12 +186,12 @@ impl<const N: u64> Monitor for IterationMonitor<N> {
         let delta_iters = num_iters - self.last_report;
         if delta_iters > N {
             let delta_time = self.last_time.elapsed().unwrap().as_secs_f64();
-            let nanos_per_fuzz = (delta_time * 1000000.) / (delta_iters as f64);
+            let nanos_per_fuzz = (delta_time * 1_000_000.) / (delta_iters as f64);
 
             let (units_per_fuzz, unit) = if nanos_per_fuzz > 1_000_000. {
-                (nanos_per_fuzz * 1_000_000., "s")
+                (nanos_per_fuzz / 1_000_000., "s")
             } else if nanos_per_fuzz > 1_000. {
-                (nanos_per_fuzz * 1_000., "ms")
+                (nanos_per_fuzz / 1_000., "ms")
             } else {
                 (nanos_per_fuzz, "ns")
             };
@@ -206,31 +214,113 @@ impl Monitor for NullMonitor {
 }
 
 pub struct FuzzMutator {
-    idx: u32,
+    width: u32,
+    seen: HashSet<FuzzInput>,
 }
 
 impl FuzzMutator {
-    pub fn new() -> Self {
-        Self { idx: 0 }
+    pub fn new(width: u32) -> Self {
+        Self {
+            width,
+            seen: HashSet::new(),
+        }
+    }
+
+    pub fn deterministic_mutate(&mut self, queue: &mut Vec<FuzzInput>, input: &[u8]) {
+        assert!(self.width.is_power_of_two());
+        for i in 0..self.width {
+            let byte_off = i / 8;
+            let bit_off = i % 8;
+
+            let mut new_fuzz = input.to_vec();
+            new_fuzz[byte_off as usize] ^= 1 << bit_off;
+            let new_fuzz = FuzzInput { content: new_fuzz };
+
+            if self.seen.insert(new_fuzz.clone()) {
+                queue.push(new_fuzz);
+            }
+        }
+
+        for i in 0..self.width / 4 {
+            let byte_off = i / 2;
+            let bit_off = i % 8;
+
+            let mut new_fuzz = input.to_vec();
+            new_fuzz[byte_off as usize] ^= 0xF << bit_off;
+            let new_fuzz = FuzzInput { content: new_fuzz };
+
+            if self.seen.insert(new_fuzz.clone()) {
+                queue.push(new_fuzz);
+            }
+        }
+
+        for i in 0..self.width / 8 {
+            let mut new_fuzz = input.to_vec();
+            new_fuzz[i as usize] ^= 0xFF;
+            let new_fuzz = FuzzInput { content: new_fuzz };
+
+            if self.seen.insert(new_fuzz.clone()) {
+                queue.push(new_fuzz);
+            }
+        }
+
+        for i in 0..self.width / 8 {
+            for j in 0..35 {
+                let mut new_fuzz = input.to_vec();
+                new_fuzz[i as usize] = new_fuzz[i as usize].wrapping_add(j);
+                let new_fuzz = FuzzInput { content: new_fuzz };
+
+                if self.seen.insert(new_fuzz.clone()) {
+                    queue.push(new_fuzz);
+                }
+
+                let mut new_fuzz = input.to_vec();
+                new_fuzz[i as usize] = new_fuzz[i as usize].wrapping_sub(j);
+                let new_fuzz = FuzzInput { content: new_fuzz };
+
+                if self.seen.insert(new_fuzz.clone()) {
+                    queue.push(new_fuzz);
+                }
+            }
+        }
     }
 }
 
 impl FuzzServer {
-    pub fn new(cmd: &str) -> io::Result<Self> {
-        let fork_server = ForkServer::new(&cmd)?;
+    pub fn new(cmd: &str) -> ProtocolResult<Self> {
+        let mut fork_server = ForkServer::new(&cmd)?;
+
+        let Message::InputWidth { width } = fork_server.server_socket.read_message()? else {
+            return Err(ProtocolError::other(
+                "Expected input width message from fork server",
+            ));
+        };
 
         Ok(Self {
             fork_server,
-            mutator: FuzzMutator::new(),
-            queue: VecDeque::new(),
+            current_datas: Vec::new(),
+            mutator: FuzzMutator::new(width),
+            run_queue: Vec::new(),
+            mutation_queue: Vec::new(),
         })
     }
 
-    fn on_exec(&mut self, idx: usize) -> Result<(), ToWriterError> {
-        let data = self.mutator.idx.to_le_bytes().to_vec();
-        self.mutator.idx += 1;
+    fn on_exec(&mut self, idx: usize) -> ProtocolResult<()> {
+        if self.run_queue.is_empty() {
+            self.refresh_queue();
+        }
 
-        self.fork_server.forks[idx].send_message(&Message::Data { content: data })?;
+        // dbg!(self.mutation_queue.len());
+        // dbg!(self.run_queue.len());
+        //
+        // dbg!(&self.run_queue);
+        // dbg!(&self.mutation_queue);
+        //
+        let data = self.run_queue.pop().unwrap();
+        self.current_datas[idx] = Some(data.clone());
+        self.fork_server.forks[idx].send_message(&Message::Data {
+            content: data.content,
+        })?;
 
         Ok(())
     }
@@ -254,14 +344,28 @@ impl FuzzServer {
         })
     }
 
+    pub fn refresh_queue(&mut self) {
+        println!("Refreshing Queue");
+
+        for candidate in self.mutation_queue.iter() {
+            self.mutator
+                .deterministic_mutate(&mut self.run_queue, &candidate.content);
+        }
+        self.mutation_queue.clear();
+
+        println!("New queue has {} inputs.", self.run_queue.len());
+    }
+
     pub fn fuzz_loop<M: Monitor>(
         &mut self,
         num_children: u16,
         iterations: Option<u64>,
-    ) -> Result<(), ToWriterError> {
+    ) -> ProtocolResult<()> {
         let mut num_iters = 0;
 
         for _ in 0..num_children {
+            self.current_datas.push(None);
+
             num_iters += 1;
 
             let idx = self.fork_server.create_fork()?;
@@ -269,6 +373,7 @@ impl FuzzServer {
         }
 
         let mut fork_offset = 0;
+        let mut branches_found = 0u64;
 
         let mut seen_covmaps = HashSet::new();
 
@@ -281,13 +386,26 @@ impl FuzzServer {
 
             let fork = &mut self.fork_server.forks[fork_offset as usize];
             if let Some(fuzz_finish) = Self::try_finish(fork) {
+                fork.send_message(&Message::Exit)?;
+
                 match fuzz_finish {
                     FuzzFinish::Data { hash, data: _ } => {
                         let is_new = seen_covmaps.insert(hash);
-                        //
-                        // if is_new {
-                        //     println!("Is new");
-                        // }
+
+                        if is_new {
+                            branches_found += 1;
+
+                            if branches_found % 100 == 0 {
+                                println!("Found {branches_found} branches");
+                            }
+
+                            self.mutation_queue.push(
+                                self.current_datas[fork_offset as usize]
+                                    .as_ref()
+                                    .unwrap()
+                                    .clone(),
+                            );
+                        }
                     }
                     _ => {}
                 };
@@ -295,6 +413,10 @@ impl FuzzServer {
                 num_iters += 1;
                 if iterations.is_some_and(|iterations| iterations <= num_iters) {
                     break;
+                }
+
+                if self.run_queue.is_empty() {
+                    self.refresh_queue();
                 }
 
                 self.fork_server.replace_fork(fork_offset as usize).unwrap();
@@ -309,7 +431,7 @@ impl FuzzServer {
 
     pub fn clean(mut self) -> io::Result<()> {
         self.fork_server
-            .server_sockets
+            .server_socket
             .send_message(&Message::Exit)
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to send exit message"))?;
         self.fork_server.server.wait()?;
@@ -324,7 +446,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut fuzz_server = FuzzServer::new(&cmd)?;
-    fuzz_server.fuzz_loop::<IterationMonitor<1000>>(20, Some(10_000))?;
+    let initial_width = fuzz_server.mutator.width;
+    fuzz_server.mutation_queue.push(FuzzInput {
+        content: vec![0; initial_width.div_ceil(8) as usize],
+    });
+    fuzz_server.fuzz_loop::<IterationMonitor<1000>>(20, Some(1_000_000))?;
     fuzz_server.clean()?;
 
     Ok(())

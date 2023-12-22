@@ -5,13 +5,14 @@
 #include <stdint.h>
 
 enum message_variant_t {
-    MSG_FAIL = 0,
-    MSG_ACK  = 1,
-    MSG_STATUS_CHECK = 2,
-    MSG_EXIT = 3,
+    MSG_FAIL         =  0,
+    MSG_ACK          =  1,
+    MSG_STATUS_CHECK =  2,
+    MSG_EXIT         =  3,
 
-    MSG_FORK = 16,
-    MSG_DATA = 17,
+    MSG_FORK         = 16,
+    MSG_DATA         = 17,
+    MSG_INPUT_WIDTH  = 18,
 };
 
 struct data_bytearray_t {
@@ -27,6 +28,7 @@ struct data_str_t {
 union message_data_t {
     data_bytearray_t bytearray;
     data_str_t str;
+    uint32_t input_width;
 
 	message_data_t() {
 		this->bytearray.len = 0;
@@ -48,6 +50,7 @@ public:
     static Message ack();
     static Message fail(char *str, uint16_t len);
     static Message status_check();
+    static Message input_width(uint32_t width);
     static Message data_msg(uint8_t *bytearray, uint32_t len);
 };
 

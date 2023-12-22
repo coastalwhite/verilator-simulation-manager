@@ -44,6 +44,24 @@ ForkClient::ForkClient(const int argc, const char **argv) {
 
 ForkClient::~ForkClient() { delete this->socket; }
 
+void ForkClient::send_input_width(uint32_t width) {
+    Message::input_width(width).write_to_socket(this->socket->socket_fd);
+}
+
+void Socket::await_exit() {
+	shutdown(this->socket_fd, SHUT_WR);
+
+    Message msg = Message::read_from_socket(this->socket_fd);
+
+    if (msg.variant != MSG_EXIT) {
+        perror("Expected exit message got something else");
+        exit(1);
+    }
+
+    close(this->socket_fd);
+    raise(SIGQUIT);
+}
+
 Socket *ForkClient::await_fork() {
     while (1) {
         Message msg = Message::read_from_socket(this->socket->socket_fd);
@@ -53,7 +71,6 @@ Socket *ForkClient::await_fork() {
             kill(0, SIGQUIT);
 
             exit(0);
-
             break;
         case MSG_FAIL:
             perror("Received a fail message");

@@ -5,12 +5,40 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+int recv_all(int fd, uint8_t *src, size_t n) {
+    while (n > 0) {
+        int t = recv(fd, src, n, 0);
+
+        if (t < 0) return t;
+
+        src += t;
+        n -= t;
+    }
+
+    return 0;
+}
+
+int send_all(int fd, uint8_t *src, size_t n) {
+    while (n > 0) {
+        int t = send(fd, src, n, 0);
+
+        if (t < 0) return t;
+
+        src += t;
+        n -= t;
+    }
+
+    return 0;
+}
+
+
 Message::Message() : variant(MSG_ACK), content() {}
 Message::~Message() {
     switch (this->variant) {
     case (MSG_ACK):
     case (MSG_STATUS_CHECK):
     case (MSG_EXIT):
+    case (MSG_INPUT_WIDTH):
         break;
     case (MSG_FAIL):
         free(this->content.str.ptr);
@@ -24,20 +52,66 @@ Message::~Message() {
     }
 }
 
-data_str_t take_string(int fd) {
-    uint8_t bs[2];
+uint32_t take_u32(int fd) {
+    uint8_t bs[4];
 
-    if (recv(fd, bs, 2, 0) < 0) {
+    if (recv_all(fd, bs, 4) < 0) {
         perror("Read error");
         exit(1);
     }
 
-    size_t hb = (size_t)bs[1];
-    size_t lb = (size_t)bs[0];
+    uint32_t b3 = (uint32_t)bs[3];
+    uint32_t b2 = (uint32_t)bs[2];
+    uint32_t b1 = (uint32_t)bs[1];
+    uint32_t b0 = (uint32_t)bs[0];
 
+    return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+}
+
+void write_u32(int fd, uint16_t n) {
+    uint8_t bs[4];
+
+    bs[0] = (n >> 0) & 0xFF;
+    bs[1] = (n >> 8) & 0xFF;
+    bs[2] = (n >> 16) & 0xFF;
+    bs[3] = (n >> 24) & 0xFF;
+
+    if (send_all(fd, bs, 4) < 0) {
+        perror("Write error");
+        exit(1);
+    }
+}
+
+uint16_t take_u16(int fd) {
+    uint8_t bs[2];
+
+    if (recv_all(fd, bs, 2) < 0) {
+        perror("Read error");
+        exit(1);
+    }
+
+    uint16_t b1 = (uint16_t)bs[1];
+    uint16_t b0 = (uint16_t)bs[0];
+
+    return (b1 << 8) | b0;
+}
+
+void write_u16(int fd, uint16_t n) {
+    uint8_t bs[2];
+
+    bs[0] = (n >> 0) & 0xFF;
+    bs[1] = (n >> 8) & 0xFF;
+
+    if (send_all(fd, bs, 2) < 0) {
+        perror("Write error");
+        exit(1);
+    }
+}
+
+data_str_t take_string(int fd) {
     data_str_t str;
 
-    str.len = (hb << 8) | lb;
+    str.len = take_u16(fd);
     str.ptr = (char *)malloc(str.len);
 
     if (str.ptr == NULL) {
@@ -45,7 +119,7 @@ data_str_t take_string(int fd) {
         exit(1);
     }
 
-    if (recv(fd, str.ptr, str.len, 0) < 0) {
+    if (recv_all(fd, (uint8_t*) str.ptr, (size_t) str.len) < 0) {
         perror("Read error");
         exit(1);
     }
@@ -53,22 +127,11 @@ data_str_t take_string(int fd) {
     return str;
 }
 
+
 data_bytearray_t take_bytearray(int fd) {
-    uint8_t bs[4];
-
-    if (recv(fd, bs, 4, 0) < 0) {
-        perror("Read error");
-        exit(1);
-    }
-
-    size_t b3 = (size_t)bs[3];
-    size_t b2 = (size_t)bs[2];
-    size_t b1 = (size_t)bs[1];
-    size_t b0 = (size_t)bs[0];
-
     data_bytearray_t bytearray;
 
-    bytearray.len = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;
+    bytearray.len = take_u32(fd);
     bytearray.ptr = (uint8_t *)malloc(bytearray.len);
 
     if (bytearray.ptr == NULL) {
@@ -76,7 +139,7 @@ data_bytearray_t take_bytearray(int fd) {
         exit(1);
     }
 
-    if (recv(fd, bytearray.ptr, bytearray.len, 0) < 0) {
+    if (recv_all(fd, bytearray.ptr, bytearray.len) < 0) {
         perror("Read error");
         exit(1);
     }
@@ -85,36 +148,18 @@ data_bytearray_t take_bytearray(int fd) {
 }
 
 void write_str(int fd, data_str_t str) {
-    uint8_t bs[2];
+    write_u16(fd, str.len);
 
-    bs[0] = (str.len >> 0) & 0xFF;
-    bs[1] = (str.len >> 8) & 0xFF;
-
-    if (send(fd, bs, 2, 0) < 0) {
-        perror("Write error");
-        exit(1);
-    }
-
-    if (send(fd, str.ptr, str.len, 0) < 0) {
+    if (send_all(fd, (uint8_t*) str.ptr, (size_t) str.len) < 0) {
         perror("Write error");
         exit(1);
     }
 }
 
 void write_bytearray(int fd, data_bytearray_t bytearray) {
-    uint8_t bs[4];
+    write_u32(fd, bytearray.len);
 
-    bs[0] = (bytearray.len >> 0) & 0xFF;
-    bs[1] = (bytearray.len >> 8) & 0xFF;
-    bs[2] = (bytearray.len >> 16) & 0xFF;
-    bs[3] = (bytearray.len >> 24) & 0xFF;
-
-    if (send(fd, bs, 4, 0) < 0) {
-        perror("Write error");
-        exit(1);
-    }
-
-    if (send(fd, bytearray.ptr, bytearray.len, 0) < 0) {
+    if (send_all(fd, bytearray.ptr, bytearray.len) < 0) {
         perror("Write error");
         exit(1);
     }
@@ -122,7 +167,7 @@ void write_bytearray(int fd, data_bytearray_t bytearray) {
 
 Message Message::read_from_socket(int fd) {
     uint8_t variant;
-    if (recv(fd, &variant, 1, 0) < 0) {
+    if (recv_all(fd, &variant, 1) < 0) {
         perror("Read error");
         exit(1);
     }
@@ -142,6 +187,9 @@ Message Message::read_from_socket(int fd) {
     case MSG_DATA:
         msg.content.bytearray = take_bytearray(fd);
         break;
+    case MSG_INPUT_WIDTH:
+        msg.content.input_width = take_u32(fd);
+        break;
     default:
         perror("Invalid variant");
         exit(1);
@@ -153,7 +201,7 @@ Message Message::read_from_socket(int fd) {
 
 void Message::write_to_socket(int fd) {
     uint8_t variant = (uint8_t)this->variant;
-    if (send(fd, &variant, 1, 0) < 0) {
+    if (send_all(fd, &variant, 1) < 0) {
         perror("Send error");
         exit(1);
     }
@@ -169,6 +217,9 @@ void Message::write_to_socket(int fd) {
         break;
     case (MSG_DATA):
         write_bytearray(fd, this->content.bytearray);
+        break;
+    case (MSG_INPUT_WIDTH):
+        write_u32(fd, this->content.input_width);
         break;
     }
 }
@@ -190,6 +241,13 @@ Message Message::fail(char *str, uint16_t len) {
 Message Message::status_check() {
     Message msg;
     msg.variant = MSG_STATUS_CHECK;
+    return msg;
+}
+
+Message Message::input_width(uint32_t width) {
+    Message msg;
+    msg.variant = MSG_INPUT_WIDTH;
+    msg.content.input_width = width;
     return msg;
 }
 
