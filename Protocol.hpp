@@ -27,7 +27,6 @@ struct data_str_t {
 union message_data_t {
     data_bytearray_t bytearray;
     data_str_t str;
-    data_str_t paths[2];
 
 	message_data_t() {
 		this->bytearray.len = 0;

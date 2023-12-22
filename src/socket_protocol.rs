@@ -1,13 +1,28 @@
+use std::fmt::Display;
+
+#[derive(Debug)]
 pub enum FromReaderError {
     Io(std::io::Error),
     Utf8(std::string::FromUtf8Error),
     Other(String),
 }
 
+#[derive(Debug)]
 pub enum ToWriterError {
     Io(std::io::Error),
     Other(String),
 }
+
+impl Display for ToWriterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToWriterError::Io(err) => write!(f, "IOError: {err}"),
+            ToWriterError::Other(s) => f.write_str(&s),
+        }
+    }
+}
+
+impl std::error::Error for ToWriterError {}
 
 impl From<std::io::Error> for FromReaderError {
     fn from(value: std::io::Error) -> Self {
@@ -208,6 +223,7 @@ define_messages! {
     1 = Ack,
     2 = StatusCheck,
     3 = Exit,
-    16 = Fork { sc_socket: String, cs_socket: String },
+
+    16 = Fork { socket_path: String },
     17 = Data { content: Vec<u8> },
 }

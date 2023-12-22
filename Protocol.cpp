@@ -10,13 +10,13 @@ Message::~Message() {
     switch (this->variant) {
     case (MSG_ACK):
     case (MSG_STATUS_CHECK):
+    case (MSG_EXIT):
         break;
     case (MSG_FAIL):
         free(this->content.str.ptr);
         break;
     case (MSG_FORK):
-        free(this->content.paths[0].ptr);
-        free(this->content.paths[1].ptr);
+        free(this->content.str.ptr);
         break;
     case (MSG_DATA):
         free(this->content.bytearray.ptr);
@@ -133,13 +133,11 @@ Message Message::read_from_socket(int fd) {
     switch (variant) {
     case MSG_ACK:
     case MSG_STATUS_CHECK:
+    case MSG_EXIT:
         break;
     case MSG_FAIL:
-        msg.content.str = take_string(fd);
-        break;
     case MSG_FORK:
-        msg.content.paths[0] = take_string(fd);
-        msg.content.paths[1] = take_string(fd);
+        msg.content.str = take_string(fd);
         break;
     case MSG_DATA:
         msg.content.bytearray = take_bytearray(fd);
@@ -163,13 +161,11 @@ void Message::write_to_socket(int fd) {
     switch (this->variant) {
     case (MSG_ACK):
     case (MSG_STATUS_CHECK):
+    case (MSG_EXIT):
         break;
     case (MSG_FAIL):
-        write_str(fd, this->content.str);
-        break;
     case (MSG_FORK):
-        perror("Client cannot send fork requests to server.");
-        exit(1);
+        write_str(fd, this->content.str);
         break;
     case (MSG_DATA):
         write_bytearray(fd, this->content.bytearray);

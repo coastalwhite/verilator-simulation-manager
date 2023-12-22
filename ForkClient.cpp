@@ -1,87 +1,59 @@
 #include "ForkClient.hpp"
 
 #include "Protocol.hpp"
+#include <filesystem>
 #include <stdio.h>
 #include <stdlib.h>
-#include <filesystem>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <signal.h>
 #include <sys/un.h>
 #include <unistd.h>
 
-SocketPair::SocketPair() : sc_socket_fd(0), cs_socket_fd(0) {}
+Socket::Socket() : socket_fd(0) {}
 
-SocketPair::SocketPair(const char *sc_socket_path, const char *cs_socket_path) {
-    int sc_socket_listener_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    int cs_socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+Socket::Socket(const char *socket_path) {
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 
-    struct sockaddr_un sc_address, cs_address;
+    struct sockaddr_un address;
 
-    sc_address.sun_family = AF_UNIX;
-    cs_address.sun_family = AF_UNIX;
+    address.sun_family = AF_UNIX;
 
-    strcpy(sc_address.sun_path, sc_socket_path);
-    strcpy(cs_address.sun_path, cs_socket_path);
+    strcpy(address.sun_path, socket_path);
 
-	unlink(sc_socket_path);
-    if (bind(sc_socket_listener_fd, (struct sockaddr *)&sc_address, sizeof(sc_address)) <
-        0) {
-        perror("Bind Failed");
+    if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("Connecting to socket failed");
         exit(EXIT_FAILURE);
     }
 
-    if (listen(sc_socket_listener_fd, 1) < 0) {
-        perror("Listen Failed");
-        exit(EXIT_FAILURE);
-    }
-
-    if (connect(cs_socket_fd, (struct sockaddr *)&cs_address,
-                sizeof(cs_address)) < 0) {
-        perror("Connect Failed");
-        exit(EXIT_FAILURE);
-    }
-
-    socklen_t addr_size = sizeof(sc_address);
-
-    int sc_socket_fd;
-    if ((sc_socket_fd = accept(sc_socket_listener_fd, (struct sockaddr *)&sc_address,
-                                   &addr_size)) < 0) {
-        perror("Accept Failed");
-        exit(EXIT_FAILURE);
-    }
-
-	close(sc_socket_listener_fd);
-
-    this->sc_socket_fd = sc_socket_fd;
-    this->cs_socket_fd = cs_socket_fd;
-}
-
-SocketPair::~SocketPair() {
-    close(this->sc_socket_fd);
-    close(this->cs_socket_fd);
+    this->socket_fd = socket_fd;
 }
 
 ForkClient::ForkClient(const int argc, const char **argv) {
-    if (argc < 3) {
-        perror("[ERROR]: not enough args");
+    if (argc < 2) {
+        perror("[ERROR]: ForkClient expects the first argument to be the "
+               "socket path");
         exit(2);
     }
 
-    const char *sc_socket_path = argv[1];
-    const char *cs_socket_path = argv[2];
+    const char *socket_path = argv[1];
 
-    pair = new SocketPair(sc_socket_path, cs_socket_path);
+    this->socket = new Socket(socket_path);
 }
 
-ForkClient::~ForkClient() { delete this->pair; }
+ForkClient::~ForkClient() { delete this->socket; }
 
-SocketPair* ForkClient::await_fork() {
+Socket *ForkClient::await_fork() {
     while (1) {
-        Message msg = Message::read_from_socket(this->pair->sc_socket_fd);
+        Message msg = Message::read_from_socket(this->socket->socket_fd);
         switch (msg.variant) {
         case MSG_EXIT:
+            signal(SIGQUIT, SIG_IGN);
+            kill(0, SIGQUIT);
+
             exit(0);
+
             break;
         case MSG_FAIL:
             perror("Received a fail message");
@@ -106,23 +78,15 @@ SocketPair* ForkClient::await_fork() {
             result.is_fork = p == 0;
 
             if (p == 0) {
-                char *sc_socket_path =
-                    (char *)malloc(msg.content.paths[0].len + 1);
-                char *cs_socket_path =
-                    (char *)malloc(msg.content.paths[1].len + 1);
+                char *socket_path = (char *)malloc(msg.content.str.len + 1);
+                memcpy(socket_path, msg.content.str.ptr, msg.content.str.len);
+                socket_path[msg.content.str.len] = 0;
 
-                memcpy(sc_socket_path, msg.content.paths[0].ptr, msg.content.paths[0].len);
-                memcpy(cs_socket_path, msg.content.paths[1].ptr, msg.content.paths[1].len);
+                Socket *result = new Socket(socket_path);
 
-                sc_socket_path[msg.content.paths[0].len] = 0;
-                cs_socket_path[msg.content.paths[1].len] = 0;
+                free(socket_path);
 
-                SocketPair *result_pair = new SocketPair(sc_socket_path, cs_socket_path);
-
-                free(sc_socket_path);
-                free(cs_socket_path);
-
-				return result_pair;
+                return result;
             }
 
             return nullptr;
