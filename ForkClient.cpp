@@ -12,7 +12,6 @@
 #include <unistd.h>
 
 Socket::Socket() : socket_fd(0) {}
-
 Socket::Socket(const char *socket_path) {
     int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 
@@ -23,7 +22,7 @@ Socket::Socket(const char *socket_path) {
     strcpy(address.sun_path, socket_path);
 
     if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("Connecting to socket failed");
+        perror("Failed to connect to socket");
         exit(EXIT_FAILURE);
     }
 
@@ -32,8 +31,7 @@ Socket::Socket(const char *socket_path) {
 
 ForkClient::ForkClient(const int argc, const char **argv) {
     if (argc < 2) {
-        perror("[ERROR]: ForkClient expects the first argument to be the "
-               "socket path");
+        perror("ForkClient expects the first argument to be the socket path");
         exit(2);
     }
 
@@ -48,70 +46,54 @@ void ForkClient::send_input_width(uint32_t width) {
     Message::input_width(width).write_to_socket(this->socket->socket_fd);
 }
 
-void Socket::await_exit() {
-	shutdown(this->socket_fd, SHUT_WR);
-
-    Message msg = Message::read_from_socket(this->socket_fd);
-
-    if (msg.variant != MSG_EXIT) {
-        perror("Expected exit message got something else");
+void Socket::clean_exit() {
+    if (shutdown(this->socket_fd, SHUT_WR) != 0) {
+        perror("Failed to shutdown socket");
         exit(1);
     }
 
-    close(this->socket_fd);
     raise(SIGQUIT);
 }
 
 Socket *ForkClient::await_fork() {
-    while (1) {
-        Message msg = Message::read_from_socket(this->socket->socket_fd);
-        switch (msg.variant) {
-        case MSG_EXIT:
-            signal(SIGQUIT, SIG_IGN);
-            kill(0, SIGQUIT);
+    Message msg = Message::read_from_socket(this->socket->socket_fd);
+    switch (msg.variant) {
+    case MSG_FORK: {
+        fork_result_t result;
+        int p = fork();
 
-            exit(0);
-            break;
-        case MSG_FAIL:
-            perror("Received a fail message");
-            exit(1);
-            break;
-        case MSG_ACK:
-            perror("Received an ACK message");
-            exit(1);
-            break;
-        case MSG_DATA:
-            perror("Received an data message");
-            exit(1);
-            break;
-        case MSG_STATUS_CHECK:
-            perror("Received an status check message");
-            exit(1);
-            break;
-        case MSG_FORK: {
-            fork_result_t result;
-            int p = fork();
+        result.is_fork = p == 0;
 
-            result.is_fork = p == 0;
+        if (p == 0) {
+            char *socket_path = (char *)malloc(msg.content.str.len + 1);
+            memcpy(socket_path, msg.content.str.ptr, msg.content.str.len);
+            socket_path[msg.content.str.len] = 0;
 
-            if (p == 0) {
-                char *socket_path = (char *)malloc(msg.content.str.len + 1);
-                memcpy(socket_path, msg.content.str.ptr, msg.content.str.len);
-                socket_path[msg.content.str.len] = 0;
+            Socket *result = new Socket(socket_path);
 
-                Socket *result = new Socket(socket_path);
+            free(socket_path);
 
-                free(socket_path);
-
-                return result;
-            }
-
-            return nullptr;
+            return result;
         }
-        default:
-            perror("Unknown message variant");
-            exit(1);
-            break;
-        }
+
+        return nullptr;
     }
+    case MSG_EXIT:
+		printf("Received the EXIT message, exiting...\n");
+		this->socket->clean_exit();
+    case MSG_FAIL:
+        perror("Expected FORK message, received FAIL message.");
+        break;
+    case MSG_ACK:
+        perror("Expected FORK message, received ACK message.");
+        break;
+    case MSG_DATA:
+        perror("Expected FORK message, received DATA message.");
+        break;
+    default:
+        perror("Expected FORK message, received unknown message variant.");
+        break;
+    }
+
+    exit(1);
 }

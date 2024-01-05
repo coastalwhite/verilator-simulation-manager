@@ -1,22 +1,25 @@
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
-use std::io::{self, Write};
+use fxhash::FxHashSet;
+use std::hash::Hash;
+
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::Receiver;
 use std::time::{self, Duration, SystemTime};
+
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 
 use crate::socket_protocol::{Message, ProtocolError};
 
-use self::socket_protocol::ProtocolResult;
+use self::socket_protocol::{MessageChannel, ProtocolResult};
 
 mod socket_protocol;
 
 #[derive(Debug)]
 pub struct Socket {
-    stream: UnixStream,
+    channel: MessageChannel<UnixStream>,
 }
 
 impl Socket {
@@ -37,49 +40,45 @@ impl Socket {
         stream.set_read_timeout(Some(Duration::from_secs(1)))?;
         stream.set_write_timeout(Some(Duration::from_secs(1)))?;
 
-        let socket = Self { stream };
+        let socket = Self {
+            channel: MessageChannel::new(stream),
+        };
 
         Ok(socket)
     }
 
-    pub fn new_fork(server_pair: &mut Self, idx: usize) -> ProtocolResult<Socket> {
+    pub fn new_fork(server_pair: &mut Self, idx: usize) -> ProtocolResult<UnixStream> {
         let socket_path = Self::new_path(idx + 1)?;
 
         let socket_listener = UnixListener::bind(&socket_path)?;
-        server_pair
-            .send_message(&Message::Fork { socket_path })
-            .unwrap();
+        server_pair.send_message(&Message::Fork { socket_path })?;
         let (stream, _socket_addr) = socket_listener.accept()?;
 
         stream.set_nonblocking(true)?;
-        let socket = Self { stream };
-
-        Ok(socket)
+        Ok(stream)
     }
 
-    pub fn try_read_message(&mut self) -> Option<Message> {
-        use socket_protocol::FromReader;
-        Message::from_reader(&mut self.stream)
-            .map_err(|err| {
-                if !matches!(&err, ProtocolError::Io(io_err) if io_err.kind() == std::io::ErrorKind::WouldBlock) {
-                    dbg!(&err);
-                }
-                err
-            })
-            .ok()
+    pub fn replace_socket(&mut self, new_socket: UnixStream) -> UnixStream {
+        let old_socket = self.channel.replace(new_socket);
+        old_socket
+    }
+
+    pub fn try_read_message(&mut self) -> ProtocolResult<Option<Message>> {
+        self.channel.try_recv()
     }
 
     pub fn read_message(&mut self) -> ProtocolResult<Message> {
-        use socket_protocol::FromReader;
-        let msg = Message::from_reader(&mut self.stream)?;
-        Ok(msg)
+        // println!("Start Read");
+        let message = self.channel.recv()?;
+        // println!("End Read");
+
+        Ok(message)
     }
 
     pub fn send_message(&mut self, msg: &Message) -> ProtocolResult<()> {
-        use socket_protocol::ToWriter;
-
-        msg.to_writer(&mut self.stream)?;
-        self.stream.flush()?;
+        // println!("Start Write");
+        self.channel.send(msg)?;
+        // println!("End Write");
 
         Ok(())
     }
@@ -127,16 +126,18 @@ impl ForkServer {
 
     pub fn create_fork(&mut self) -> ProtocolResult<usize> {
         let idx = self.forks.len();
-        let socket = Socket::new_fork(&mut self.server_socket, idx)?;
-        self.forks.push(socket);
+        let stream = Socket::new_fork(&mut self.server_socket, idx)?;
+        self.forks.push(Socket { channel: MessageChannel::new(stream) });
 
         Ok(idx)
     }
 
     pub fn replace_fork(&mut self, at: usize) -> ProtocolResult<()> {
-        let pair = Socket::new_fork(&mut self.server_socket, at)?;
+        let stream = Socket::new_fork(&mut self.server_socket, at)?;
+        let old_stream = self.forks[at].replace_socket(stream);
 
-        self.forks[at] = pair;
+        // @Q: Is this only proper to do or actually needed?
+        old_stream.shutdown(std::net::Shutdown::Both)?;
 
         Ok(())
     }
@@ -149,6 +150,8 @@ pub struct FuzzInput {
 
 pub struct FuzzServer {
     fork_server: ForkServer,
+
+    exit_request_channel: Receiver<()>,
 
     current_datas: Vec<Option<FuzzInput>>,
 
@@ -215,14 +218,16 @@ impl Monitor for NullMonitor {
 
 pub struct FuzzMutator {
     width: u32,
-    seen: HashSet<FuzzInput>,
+    seen: FxHashSet<FuzzInput>,
+    rng: ChaCha20Rng,
 }
 
 impl FuzzMutator {
-    pub fn new(width: u32) -> Self {
+    pub fn new(width: u32, rng: ChaCha20Rng) -> Self {
         Self {
             width,
-            seen: HashSet::new(),
+            seen: FxHashSet::default(),
+            rng,
         }
     }
 
@@ -287,7 +292,7 @@ impl FuzzMutator {
 }
 
 impl FuzzServer {
-    pub fn new(cmd: &str) -> ProtocolResult<Self> {
+    pub fn new(cmd: &str, exit_request_channel: Receiver<()>) -> ProtocolResult<Self> {
         let mut fork_server = ForkServer::new(&cmd)?;
 
         let Message::InputWidth { width } = fork_server.server_socket.read_message()? else {
@@ -296,10 +301,13 @@ impl FuzzServer {
             ));
         };
 
+        let rng = ChaCha20Rng::from_seed([0u8; 32]);
+
         Ok(Self {
             fork_server,
+            exit_request_channel,
             current_datas: Vec::new(),
-            mutator: FuzzMutator::new(width),
+            mutator: FuzzMutator::new(width, rng),
             run_queue: Vec::new(),
             mutation_queue: Vec::new(),
         })
@@ -310,12 +318,6 @@ impl FuzzServer {
             self.refresh_queue();
         }
 
-        // dbg!(self.mutation_queue.len());
-        // dbg!(self.run_queue.len());
-        //
-        // dbg!(&self.run_queue);
-        // dbg!(&self.mutation_queue);
-        //
         let data = self.run_queue.pop().unwrap();
         self.current_datas[idx] = Some(data.clone());
         self.fork_server.forks[idx].send_message(&Message::Data {
@@ -325,12 +327,10 @@ impl FuzzServer {
         Ok(())
     }
 
-    fn try_finish(fork: &mut Socket) -> Option<FuzzFinish> {
-        fork.try_read_message().map(|msg| match msg {
+    fn try_finish(fork: &mut Socket) -> ProtocolResult<Option<FuzzFinish>> {
+        Ok(fork.try_read_message()?.map(|msg| match msg {
             Message::Data { content } => {
-                let mut hasher = DefaultHasher::new();
-                content.hash(&mut hasher);
-                let hash = hasher.finish();
+                let hash = fxhash::hash64(&content);
 
                 FuzzFinish::Data {
                     hash,
@@ -341,17 +341,30 @@ impl FuzzServer {
                 eprintln!("[WARN]: Did not receive a data message");
                 FuzzFinish::InvalidResponse
             }
-        })
+        }))
     }
 
     pub fn refresh_queue(&mut self) {
         println!("Refreshing Queue");
 
-        for candidate in self.mutation_queue.iter() {
-            self.mutator
-                .deterministic_mutate(&mut self.run_queue, &candidate.content);
+        if self.mutation_queue.is_empty() {
+            println!("No items in mutation queue, starting from random.");
+
+            let size = self.mutator.width.div_ceil(8) as usize;
+            let mut content = Vec::with_capacity(size);
+
+            for _ in 0..size {
+                content.push(self.mutator.rng.gen());
+            }
+
+            self.run_queue.push(FuzzInput { content });
+        } else {
+            for candidate in self.mutation_queue.iter() {
+                self.mutator
+                    .deterministic_mutate(&mut self.run_queue, &candidate.content);
+            }
+            self.mutation_queue.clear();
         }
-        self.mutation_queue.clear();
 
         println!("New queue has {} inputs.", self.run_queue.len());
     }
@@ -375,19 +388,22 @@ impl FuzzServer {
         let mut fork_offset = 0;
         let mut branches_found = 0u64;
 
-        let mut seen_covmaps = HashSet::new();
+        let mut seen_covmaps = FxHashSet::default();
 
         let mut monitor = M::init();
         loop {
             fork_offset += 1;
             fork_offset %= num_children;
 
+            if self.exit_request_channel.try_recv().is_ok() {
+                println!("[FUZZ SERVER]: Received stop signal");
+                return Ok(());
+            }
+
             monitor.on_loop(num_iters);
 
             let fork = &mut self.fork_server.forks[fork_offset as usize];
-            if let Some(fuzz_finish) = Self::try_finish(fork) {
-                fork.send_message(&Message::Exit)?;
-
+            if let Some(fuzz_finish) = Self::try_finish(fork)? {
                 match fuzz_finish {
                     FuzzFinish::Data { hash, data: _ } => {
                         let is_new = seen_covmaps.insert(hash);
@@ -429,11 +445,10 @@ impl FuzzServer {
         Ok(())
     }
 
-    pub fn clean(mut self) -> io::Result<()> {
+    pub fn clean(mut self) -> ProtocolResult<()> {
         self.fork_server
             .server_socket
-            .send_message(&Message::Exit)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Failed to send exit message"))?;
+            .send_message(&Message::Exit)?;
         self.fork_server.server.wait()?;
 
         Ok(())
@@ -441,16 +456,19 @@ impl FuzzServer {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (tx, exit_request_channel) = std::sync::mpsc::channel();
+
+    ctrlc::set_handler(move || {
+        tx.send(()).expect("Could not send signal on channel");
+    })
+    .expect("Error setting Control-C handler");
+
     let cmd = format!(
         "/home/johndoe/Downloads/software_verilator/software/obj_dir/VSECURE_PLATFORM_RI5CY_CW",
     );
 
-    let mut fuzz_server = FuzzServer::new(&cmd)?;
-    let initial_width = fuzz_server.mutator.width;
-    fuzz_server.mutation_queue.push(FuzzInput {
-        content: vec![0; initial_width.div_ceil(8) as usize],
-    });
-    fuzz_server.fuzz_loop::<IterationMonitor<1000>>(20, Some(1_000_000))?;
+    let mut fuzz_server = FuzzServer::new(&cmd, exit_request_channel)?;
+    fuzz_server.fuzz_loop::<IterationMonitor<1000>>(20, Some(10_000))?;
     fuzz_server.clean()?;
 
     Ok(())

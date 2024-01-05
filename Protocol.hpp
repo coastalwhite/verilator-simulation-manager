@@ -7,8 +7,7 @@
 enum message_variant_t {
     MSG_FAIL         =  0,
     MSG_ACK          =  1,
-    MSG_STATUS_CHECK =  2,
-    MSG_EXIT         =  3,
+    MSG_EXIT         =  2,
 
     MSG_FORK         = 16,
     MSG_DATA         = 17,
@@ -18,6 +17,7 @@ enum message_variant_t {
 struct data_bytearray_t {
     uint32_t len;
     uint8_t* ptr;
+    bool do_free;
 };
 
 struct data_str_t {
@@ -49,7 +49,6 @@ public:
 
     static Message ack();
     static Message fail(char *str, uint16_t len);
-    static Message status_check();
     static Message input_width(uint32_t width);
     static Message data_msg(uint8_t *bytearray, uint32_t len);
 };

@@ -6,3 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+ctrlc = "3.4.2"
+fxhash = "0.2.1"
+rand = "0.8.5"
+rand_chacha = "0.3.1"

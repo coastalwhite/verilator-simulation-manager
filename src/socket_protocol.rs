@@ -1,4 +1,98 @@
 use std::fmt::Display;
+use std::io;
+
+/// A bidirectional UNIX-socket connection that reads whole messages or nothing
+///
+/// This channel is needed because it allows for polling of the UNIX-socket when messages might not
+/// be fulling formed yet. For example, if a data message is sent, the data bytes might get flushed
+/// before being fully and read buffer might not be able to read all bytes at once. In this case,
+/// we need to save what we already read and continue from there next time.
+///
+/// Because nothing of this functionality is necessarily coupled to a UNIX-socket, we make it
+/// generic over `T`. Where for any reading and writing functionality, the `T` needs to implement
+/// [`std::io::Read`] and [`std::io::Write`].
+#[derive(Debug)]
+pub struct MessageChannel<T> {
+    inner: T,
+    buffer: Vec<u8>,
+}
+
+impl<T> MessageChannel<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Replace the old underlying socket with a new socket, returning the old socket.
+    ///
+    /// This clears the internal buffer, but keeps the allocated memory for the buffer.
+    pub fn replace(&mut self, new_inner: T) -> T {
+        let old_inner = std::mem::replace(&mut self.inner, new_inner);
+        self.buffer.clear();
+        old_inner
+    }
+}
+
+impl<T: io::Read> MessageChannel<T> {
+    /// Read a full message from the channel.
+    pub fn recv(&mut self) -> ProtocolResult<Message> {
+        if let Err(err) = self.inner.read_to_end(&mut self.buffer) {
+            if err.kind() != io::ErrorKind::WouldBlock {
+                return Err(err.into());
+            }
+        }
+
+        let mut reader = self.buffer.as_slice();
+        let message = Message::from_reader(&mut reader)?;
+
+        if reader.is_empty() {
+            // If a message is successfully read, this should be the common case as messages are sent
+            // synchronously.
+            self.buffer.clear();
+        } else {
+            // This is more costly than just clearing the buffer, since we are copying the data,
+            // still we can avoid new allocations.
+
+            let message_length = self.buffer.len() - reader.len();
+            let remaining_byte_range = message_length..self.buffer.len();
+
+            self.buffer.copy_within(remaining_byte_range, 0);
+            self.buffer.truncate(message_length);
+        }
+
+        Ok(message)
+    }
+
+    /// Attempt to read a full message from the channel.
+    ///
+    /// This returns `Ok(None)` if:
+    /// - the UNIX-socket is non-blocking and reading a message would block
+    /// - a message is not fully ready to be read yet
+    pub fn try_recv(&mut self) -> ProtocolResult<Option<Message>> {
+        use io::ErrorKind as K;
+
+        self.recv().map(Option::Some).or_else(|err| match err {
+            ProtocolError::Io(ref err)
+                if matches!(err.kind(), K::WouldBlock | K::UnexpectedEof) =>
+            {
+                Ok(None)
+            }
+            err => Err(err),
+        })
+    }
+}
+
+impl<T: io::Write> MessageChannel<T> {
+    // Write a message to the channel.
+    pub fn send(&mut self, message: &Message) -> ProtocolResult<()> {
+        message.to_writer(&mut self.inner)?;
+        self.inner.flush()?;
+
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub enum ProtocolError {
@@ -24,10 +118,16 @@ impl Display for ProtocolError {
         match self {
             ProtocolError::Io(err) => write!(f, "IOError: {err}"),
             ProtocolError::Utf8(err) => write!(f, "Utf8: {err}"),
-            ProtocolError::InvalidMessageVariant(b) => write!(f, "Invalid message variant: 0x{b:02X}"),
+            ProtocolError::InvalidMessageVariant(b) => {
+                write!(f, "Invalid message variant: 0x{b:02X}")
+            }
             ProtocolError::StringOverflow => write!(f, "Given string is too large to be sent"),
-            ProtocolError::BytearrayOverflow => write!(f, "Given bytearray is too large to be sent"),
-            ProtocolError::PlatformConvert(t) => write!(f, "Platform is unable to convert {t} to usize"),
+            ProtocolError::BytearrayOverflow => {
+                write!(f, "Given bytearray is too large to be sent")
+            }
+            ProtocolError::PlatformConvert(t) => {
+                write!(f, "Platform is unable to convert {t} to usize")
+            }
             ProtocolError::Other(s) => f.write_str(&s),
         }
     }
@@ -104,7 +204,9 @@ macro_rules! define_messages {
                 reader.read_exact(std::slice::from_mut(&mut variant))?;
 
                 let variant = MessageVariant::try_from(variant)
-                    .map_err(|v| ProtocolError::InvalidMessageVariant(v))?;
+                    .map_err(|v| {
+                        ProtocolError::InvalidMessageVariant(v)
+                    })?;
 
                 match variant {
                     $(
@@ -185,7 +287,10 @@ impl FromReader for String {
 
 impl ToWriter for String {
     fn to_writer(&self, writer: &mut impl std::io::Write) -> ProtocolResult<()> {
-        let len: u16 = self.len().try_into().map_err(|_| ProtocolError::StringOverflow)?;
+        let len: u16 = self
+            .len()
+            .try_into()
+            .map_err(|_| ProtocolError::StringOverflow)?;
         len.to_writer(writer)?;
         writer.write_all(self.as_bytes())?;
 
@@ -205,7 +310,10 @@ impl FromReader for Vec<u8> {
 
 impl ToWriter for Vec<u8> {
     fn to_writer(&self, writer: &mut impl std::io::Write) -> ProtocolResult<()> {
-        let len: u32 = self.len().try_into().map_err(|_| ProtocolError::BytearrayOverflow)?;
+        let len: u32 = self
+            .len()
+            .try_into()
+            .map_err(|_| ProtocolError::BytearrayOverflow)?;
         len.to_writer(writer)?;
         writer.write_all(self)?;
 
@@ -216,8 +324,7 @@ impl ToWriter for Vec<u8> {
 define_messages! {
     0 = Fail { msg: String },
     1 = Ack,
-    2 = StatusCheck,
-    3 = Exit,
+    2 = Exit,
 
     16 = Fork { socket_path: String },
     17 = Data { content: Vec<u8> },

@@ -10,7 +10,7 @@ class Socket {
     Socket();
     Socket(const char *socket_path);
     
-    void await_exit();
+    void clean_exit();
 };
 
 struct fork_result_t {
