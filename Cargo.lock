@@ -111,6 +111,14 @@ dependencies = [
  "fxhash",
  "rand",
  "rand_chacha",
+ "vl-fork-server",
+]
+
+[[package]]
+name = "vl-fork-server"
+version = "0.1.0"
+dependencies = [
+ "rand",
 ]
 
 [[package]]
