@@ -1,13 +1,18 @@
 #include "ForkClient.hpp"
 
 #include "Protocol.hpp"
+#include "ProtocolUtil.hpp"
+#include "SharedMemory.hpp"
+
+#include <cstdlib>
 #include <filesystem>
+#include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <signal.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -30,19 +35,37 @@ Socket::Socket(const char *socket_path) {
 }
 
 ForkClient::ForkClient(const int argc, const char **argv) {
-    if (argc < 2) {
-        perror("ForkClient expects the first argument to be the socket path");
+    if (argc < 3) {
+        fprintf(stderr, "ForkClient two args. Socket path and SHM id.");
         exit(2);
     }
 
     const char *socket_path = argv[1];
+    const char *activations_path = argv[2];
+
+    ;
 
     this->socket = new Socket(socket_path);
+    this->activations = new SharedMemory(activations_path, ACCESS_READWRITE,
+                                         MAX_FORKS * 2 * sizeof(uint32_t));
+
+    this->num_forks = 0;
+    this->fork_shm_ids = nullptr;
 }
 
-ForkClient::~ForkClient() { delete this->socket; }
+ForkClient::~ForkClient() {
+    if (this->fork_shm_ids != nullptr) {
+        for (uint32_t i = 0; i < this->num_forks; i++) {
+            free(this->fork_shm_ids[i]);
+        }
+        free(this->fork_shm_ids);
+    }
 
-void ForkClient::send_input_width(uint32_t width) {
+    delete this->socket;
+    delete this->activations;
+}
+
+void ForkClient::send_input_info(uint32_t width) {
     Message::input_width(width).write_to_socket(this->socket->socket_fd);
 }
 
@@ -55,45 +78,77 @@ void Socket::clean_exit() {
     raise(SIGQUIT);
 }
 
-Socket *ForkClient::await_fork() {
-    Message msg = Message::read_from_socket(this->socket->socket_fd);
-    switch (msg.variant) {
-    case MSG_FORK: {
-        fork_result_t result;
-        int p = fork();
+void ForkClient::prepare_forks() {
+    Message msg =
+        Message::expect_from_socket(this->socket->socket_fd, MSG_NUM_FORKS);
 
-        result.is_fork = p == 0;
+    this->num_forks = msg.content.integer;
+    this->fork_shm_ids = (char **)malloc(num_forks * sizeof(char *));
 
-        if (p == 0) {
-            char *socket_path = (char *)malloc(msg.content.str.len + 1);
-            memcpy(socket_path, msg.content.str.ptr, msg.content.str.len);
-            socket_path[msg.content.str.len] = 0;
+    if (this->fork_shm_ids == nullptr) {
+        perror("Failed to allocate memory for fork_shm_ids");
+        exit(1);
+    }
 
-            Socket *result = new Socket(socket_path);
+    for (uint32_t i = 0; i < num_forks; i++) {
+        Message msg =
+            Message::expect_from_socket(this->socket->socket_fd, MSG_FORK);
 
-            free(socket_path);
+        uint32_t input_len = msg.content.fork_info.input.len;
+        uint32_t output_len = msg.content.fork_info.output.len;
+
+        char *input = (char *)malloc(input_len + 1);
+        char *output = (char *)malloc(output_len + 1);
+
+        if (input == nullptr) {
+            perror("Failed to allocate memory for input");
+            exit(1);
+        }
+        if (output == nullptr) {
+            perror("Failed to allocate memory for output");
+            exit(1);
+        }
+
+        memcpy(input, msg.content.fork_info.input.ptr, input_len);
+        memcpy(output, msg.content.fork_info.output.ptr, output_len);
+
+        input[input_len] = 0;
+        output[output_len] = 0;
+
+        this->fork_shm_ids[i * 2 + 0] = input;
+        this->fork_shm_ids[i * 2 + 1] = output;
+    }
+}
+
+fork_result_t ForkClient::block_till_fork_or_exit() {
+    uint32_t *activations = (uint32_t *)this->activations->get_data();
+
+    while (1) {
+        for (uint32_t i = 0; i < this->num_forks; i++) {
+            if (activations[i * 2] != ACTIVATION_STARTABLE) {
+                continue;
+            }
+
+            activations[i * 2] = ACTIVATION_ACTIVE;
+
+            fork_result_t result;
+
+            result.input_size = activations[i * 2 + 1];
+            result.input = this->fork_shm_ids[i * 2];
+            result.output = this->fork_shm_ids[i * 2 + 1];
 
             return result;
         }
 
-        return nullptr;
+        quit_if_no_parent();
+        sched_yield();
     }
-    case MSG_EXIT:
-		printf("Received the EXIT message, exiting...\n");
-		this->socket->clean_exit();
-    case MSG_FAIL:
-        perror("Expected FORK message, received FAIL message.");
-        break;
-    case MSG_ACK:
-        perror("Expected FORK message, received ACK message.");
-        break;
-    case MSG_DATA:
-        perror("Expected FORK message, received DATA message.");
-        break;
-    default:
-        perror("Expected FORK message, received unknown message variant.");
-        break;
-    }
+}
 
-    exit(1);
+SharedMemory ForkClient::input_shm(fork_result_t fork) {
+    return SharedMemory(fork.input, ACCESS_READONLY, SHM_MAX_INPUT_SIZE);
+}
+
+SharedMemory ForkClient::output_shm(fork_result_t fork) {
+    return SharedMemory(fork.output, ACCESS_READWRITE, SHM_OUTPUT_SIZE);
 }

@@ -12,27 +12,29 @@ enum message_variant_t {
     MSG_FORK         = 16,
     MSG_DATA         = 17,
     MSG_INPUT_WIDTH  = 18,
+	
+	MSG_NUM_FORKS    = 19,
 };
 
-struct data_bytearray_t {
+struct bytearray_t {
     uint32_t len;
     uint8_t* ptr;
     bool do_free;
 };
 
-struct data_str_t {
-    uint16_t len;
-    char* ptr;
-};
-
 union message_data_t {
-    data_bytearray_t bytearray;
-    data_str_t str;
-    uint32_t input_width;
+	struct {
+		bytearray_t input;
+		bytearray_t output;
+	} fork_info;
+
+    bytearray_t bytearray;
+    uint32_t integer;
 
 	message_data_t() {
 		this->bytearray.len = 0;
 		this->bytearray.ptr = (uint8_t*) 0;
+		this->bytearray.do_free = false;
 	}
 };
 
@@ -45,6 +47,7 @@ public:
     ~Message();
 
 	static Message read_from_socket(int fd);
+	static Message expect_from_socket(int fd, message_variant_t variant);
 	void write_to_socket(int fd);
 
     static Message ack();

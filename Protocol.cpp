@@ -1,25 +1,12 @@
 #include "Protocol.hpp"
+#include "ProtocolUtil.hpp"
 
 #include <cstdio>
 #include <cstdlib>
-#include <sys/socket.h>
-#include <signal.h>
 #include <errno.h>
+#include <signal.h>
+#include <sys/socket.h>
 #include <unistd.h>
-
-void quit_if_no_parent() {
-    // As per the kill(2) MAN page:
-    // > If sig is 0, then no signal is sent, but existence and permission
-    // >  checks are still performed; this can be used to check for the
-    // >  existence of a process ID or process group ID that the caller is
-    // >  permitted to signal.
-    //
-    // Here, we also crash on `EPERM`, but this is okay.
-    if (kill(getppid(), 0) < 0) {
-        perror("While polling the socket, the parent process became unavailable.\n");
-        exit(0);
-    }
-}
 
 /// Busy-loop to receive all `n` bytes from file-descriptor `fd` into `dst`.
 ///
@@ -32,8 +19,10 @@ ssize_t recv_all(int fd, uint8_t *dst, size_t n) {
     while (n > 0) {
         ssize_t t = recv(fd, dst, n, 0);
 
-        if (t < 0) return t;
-        if (t == 0) quit_if_no_parent();
+        if (t < 0)
+            return t;
+        if (t == 0)
+            quit_if_no_parent();
 
         dst += t;
         n -= t;
@@ -50,8 +39,10 @@ ssize_t send_all(int fd, uint8_t *src, size_t n) {
     while (n > 0) {
         ssize_t t = send(fd, src, n, 0);
 
-        if (t < 0) return t;
-        if (t == 0) quit_if_no_parent();
+        if (t < 0)
+            return t;
+        if (t == 0)
+            quit_if_no_parent();
 
         src += t;
         n -= t;
@@ -60,24 +51,27 @@ ssize_t send_all(int fd, uint8_t *src, size_t n) {
     return 0;
 }
 
+void free_bytearray(bytearray_t bytearray) {
+    if (bytearray.do_free) {
+        free(bytearray.ptr);
+    }
+}
 
 Message::Message() : variant(MSG_ACK), content() {}
 Message::~Message() {
     switch (this->variant) {
     case (MSG_ACK):
     case (MSG_INPUT_WIDTH):
+    case (MSG_NUM_FORKS):
     case (MSG_EXIT):
         break;
-    case (MSG_FAIL):
-        free(this->content.str.ptr);
-        break;
     case (MSG_FORK):
-        free(this->content.str.ptr);
+		free_bytearray(this->content.fork_info.input);
+		free_bytearray(this->content.fork_info.output);
         break;
+    case (MSG_FAIL):
     case (MSG_DATA):
-        if (this->content.bytearray.do_free) {
-            free(this->content.bytearray.ptr);
-        }
+		free_bytearray(this->content.bytearray);
         break;
     }
 }
@@ -114,56 +108,8 @@ void write_u32(int fd, uint16_t n) {
     }
 }
 
-uint16_t take_u16(int fd) {
-    uint8_t bs[2];
-
-    if (recv_all(fd, bs, 2) < 0) {
-        perror("Failed to read 2 bytes for `u16`\n");
-        exit(1);
-    }
-
-    uint16_t b1 = (uint16_t)bs[1];
-    uint16_t b0 = (uint16_t)bs[0];
-
-    // Little-Endian format
-    return (b1 << 8) | b0;
-}
-
-void write_u16(int fd, uint16_t n) {
-    uint8_t bs[2];
-
-    // Little-Endian format
-    bs[0] = (n >> 0) & 0xFF;
-    bs[1] = (n >> 8) & 0xFF;
-
-    if (send_all(fd, bs, 2) < 0) {
-        perror("Failed to write 2 bytes for `u16`\n");
-        exit(1);
-    }
-}
-
-data_str_t take_string(int fd) {
-    data_str_t str;
-
-    str.len = take_u16(fd);
-    str.ptr = (char*)malloc(str.len);
-
-    if (str.ptr == NULL) {
-        perror("Failed to allocate memory for string\n");
-        exit(1);
-    }
-
-    if (recv_all(fd, (uint8_t*) str.ptr, (size_t) str.len) < 0) {
-        perror("Failed to read string data from socket\n");
-        exit(1);
-    }
-
-    return str;
-}
-
-
-data_bytearray_t take_bytearray(int fd) {
-    data_bytearray_t bytearray;
+bytearray_t take_bytearray(int fd) {
+    bytearray_t bytearray;
 
     bytearray.len = take_u32(fd);
     bytearray.ptr = (uint8_t *)malloc(bytearray.len);
@@ -182,22 +128,24 @@ data_bytearray_t take_bytearray(int fd) {
     return bytearray;
 }
 
-void write_str(int fd, data_str_t str) {
-    write_u16(fd, str.len);
-
-    if (send_all(fd, (uint8_t*) str.ptr, (size_t) str.len) < 0) {
-        perror("Failed to write string data to socket\n");
-        exit(1);
-    }
-}
-
-void write_bytearray(int fd, data_bytearray_t bytearray) {
+void write_bytearray(int fd, bytearray_t bytearray) {
     write_u32(fd, bytearray.len);
 
     if (send_all(fd, bytearray.ptr, bytearray.len) < 0) {
         perror("Failed to write data to socket\n");
         exit(1);
     }
+}
+
+Message Message::expect_from_socket(int fd, message_variant_t variant) {
+	Message msg = Message::read_from_socket(fd);
+
+	if (msg.variant != variant) {
+		fprintf(stderr, "Expected message variant '%i', found '%i'\n", variant, msg.variant);
+		exit(1);
+	}
+
+	return msg;
 }
 
 Message Message::read_from_socket(int fd) {
@@ -216,13 +164,15 @@ Message Message::read_from_socket(int fd) {
         break;
     case MSG_FAIL:
     case MSG_FORK:
-        msg.content.str = take_string(fd);
+        msg.content.fork_info.input = take_bytearray(fd);
+        msg.content.fork_info.output = take_bytearray(fd);
         break;
     case MSG_DATA:
         msg.content.bytearray = take_bytearray(fd);
         break;
     case MSG_INPUT_WIDTH:
-        msg.content.input_width = take_u32(fd);
+    case MSG_NUM_FORKS:
+        msg.content.integer = take_u32(fd);
         break;
     default:
         perror("Variant is invalid\n");
@@ -244,15 +194,18 @@ void Message::write_to_socket(int fd) {
     case (MSG_ACK):
     case (MSG_EXIT):
         break;
-    case (MSG_FAIL):
-    case (MSG_FORK):
-        write_str(fd, this->content.str);
         break;
+    case (MSG_FORK):
+        write_bytearray(fd, this->content.fork_info.input);
+        write_bytearray(fd, this->content.fork_info.output);
+        break;
+    case (MSG_FAIL):
     case (MSG_DATA):
         write_bytearray(fd, this->content.bytearray);
         break;
     case (MSG_INPUT_WIDTH):
-        write_u32(fd, this->content.input_width);
+    case (MSG_NUM_FORKS):
+        write_u32(fd, this->content.integer);
         break;
     }
 }
@@ -266,15 +219,16 @@ Message Message::ack() {
 Message Message::fail(char *str, uint16_t len) {
     Message msg;
     msg.variant = MSG_FAIL;
-    msg.content.str.ptr = str;
-    msg.content.str.len = len;
+    msg.content.bytearray.ptr = (uint8_t*) str;
+    msg.content.bytearray.len = len;
+	msg.content.bytearray.do_free = false;
     return msg;
 }
 
 Message Message::input_width(uint32_t width) {
     Message msg;
     msg.variant = MSG_INPUT_WIDTH;
-    msg.content.input_width = width;
+    msg.content.integer = width;
     return msg;
 }
 

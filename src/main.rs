@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cmd = &Path::new(&cmd);
 
     let mut fuzz_server = FuzzServer::new(cmd, exit_request_channel)?;
-    fuzz_server.fuzz_loop::<IterationMonitor<1000>>(20, Some(10_000))?;
+    fuzz_server.fuzz_loop::<IterationMonitor<1000>>(10, Some(10_000))?;
     fuzz_server.clean()?;
 
     Ok(())

@@ -1,6 +1,7 @@
 //! Definition of messages, serialization and deserialization
 
 use std::ffi::OsString;
+use std::os::unix::prelude::OsStrExt;
 use std::path::PathBuf;
 
 use crate::error::{ProtocolError, ProtocolResult};
@@ -135,23 +136,14 @@ impl_io_for_nums! {
 
 impl FromReader for String {
     fn from_reader(reader: &mut impl std::io::Read) -> ProtocolResult<Self> {
-        let len = u16::from_reader(reader)?;
-        let mut buf = vec![0; len.into()];
-        reader.read_exact(&mut buf)?;
-        Ok(String::from_utf8(buf)?)
+        let vec = Vec::from_reader(reader)?;
+        Ok(String::from_utf8(vec)?)
     }
 }
 
 impl ToWriter for String {
     fn to_writer(&self, writer: &mut impl std::io::Write) -> ProtocolResult<()> {
-        let len: u16 = self
-            .len()
-            .try_into()
-            .map_err(|_| ProtocolError::StringOverflow)?;
-        len.to_writer(writer)?;
-        writer.write_all(self.as_bytes())?;
-
-        Ok(())
+        self.as_bytes().to_writer(writer)
     }
 }
 
@@ -168,15 +160,7 @@ impl FromReader for PathBuf {
 
 impl ToWriter for PathBuf {
     fn to_writer(&self, writer: &mut impl std::io::Write) -> ProtocolResult<()> {
-        let len: u16 = self
-            .as_os_str()
-            .len()
-            .try_into()
-            .map_err(|_| ProtocolError::StringOverflow)?;
-        len.to_writer(writer)?;
-        writer.write_all(self.as_os_str().as_encoded_bytes())?;
-
-        Ok(())
+        self.as_os_str().as_bytes().to_writer(writer)
     }
 }
 
@@ -191,6 +175,12 @@ impl FromReader for Vec<u8> {
 }
 
 impl ToWriter for Vec<u8> {
+    fn to_writer(&self, writer: &mut impl std::io::Write) -> ProtocolResult<()> {
+        self.as_slice().to_writer(writer)
+    }
+}
+
+impl ToWriter for &[u8] {
     fn to_writer(&self, writer: &mut impl std::io::Write) -> ProtocolResult<()> {
         let len: u32 = self
             .len()
@@ -208,7 +198,7 @@ define_messages! {
     1 = Ack,
     2 = Exit,
 
-    16 = Fork { socket_path: PathBuf },
+    16 = Fork { input: String, output: String },
     17 = Data { content: Vec<u8> },
     18 = InputWidth { width: u32 },
 }

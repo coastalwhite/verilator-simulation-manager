@@ -65,6 +65,7 @@ dependencies = [
 name = "vl-fork-server"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rand",
 ]
 
